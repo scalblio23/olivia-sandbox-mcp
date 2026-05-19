@@ -22,7 +22,7 @@ async function getOrCreateSandbox(sessionId: string): Promise<Sandbox> {
   }
 
   console.log(`[Sandbox] Creating new sandbox for session: ${sessionId}`);
-  const apiKey = process.env.E2B_API_KEY || "e2b_2eda6576301e44d63daa4f3198633eb321b07ec6";
+  const apiKey = process.env.E2B_API_KEY || "e2b_7dd3083f-f922-401d-bf94-e7d5047ef612";
   sandbox = await Sandbox.create({
     apiKey,
     timeoutMs: SANDBOX_TIMEOUT,
