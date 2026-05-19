@@ -513,7 +513,257 @@ app.post("/messages", (req, res) => {
   transport.handlePostMessage(req, res);
 });
 
-// Also support /mcp endpoint for compatibility with OliviaAI's MCP client
+// ─── Stateless JSON-RPC POST /mcp endpoint (for OliviaAI's MCP client) ────────
+// OliviaAI sends direct POST requests with JSON-RPC body and expects
+// either a JSON response or SSE "data:" lines back.
+
+// Per-request server instance for stateless mode
+app.post("/mcp", async (req, res) => {
+  const { jsonrpc, id, method, params } = req.body;
+
+  if (!method) {
+    res.status(400).json({ jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid request: missing method" } });
+    return;
+  }
+
+  // Handle initialize
+  if (method === "initialize") {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const result = {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: "olivia-sandbox", version: "1.0.0" },
+    };
+
+    res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result })}\n\n`);
+    res.end();
+    return;
+  }
+
+  // Handle tools/list
+  if (method === "tools/list") {
+    const server = createServer();
+    // Get tools by creating a temporary in-memory transport
+    const tools = [
+      {
+        name: "exec_command",
+        description: "Execute a shell command in the sandbox. Returns stdout, stderr, and exit code. Use for running any CLI command (npm, node, curl, git, python, etc.).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "The shell command to execute" },
+            workdir: { type: "string", description: "Working directory (default: /home/user)" },
+            timeout_ms: { type: "number", description: "Command timeout in milliseconds (default: 60000)" },
+            session_id: { type: "string", description: "Session ID to reuse a sandbox (default: 'default')" },
+          },
+          required: ["command"],
+        },
+      },
+      {
+        name: "write_file",
+        description: "Write content to a file in the sandbox. Creates parent directories automatically.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Absolute file path in the sandbox" },
+            content: { type: "string", description: "File content to write" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: ["path", "content"],
+        },
+      },
+      {
+        name: "read_file",
+        description: "Read the content of a file in the sandbox.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Absolute file path to read" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "list_directory",
+        description: "List files and directories at the given path in the sandbox.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Directory path to list (default: /home/user)" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "upload_file_to_sandbox",
+        description: "Upload a file from a URL into the sandbox filesystem. Useful for downloading images, assets, or data files.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "Public URL to download the file from" },
+            destination_path: { type: "string", description: "Where to save the file in the sandbox" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: ["url", "destination_path"],
+        },
+      },
+      {
+        name: "get_public_url",
+        description: "Get a public URL for a port running in the sandbox. Use after starting a web server to get an accessible URL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            port: { type: "number", description: "The port number the server is listening on" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: ["port"],
+        },
+      },
+      {
+        name: "install_packages",
+        description: "Install npm or pip packages in the sandbox.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            packages: { type: "string", description: "Space-separated package names (e.g., 'express react' or 'flask pandas')" },
+            manager: { type: "string", enum: ["npm", "pip"], description: "Package manager to use (default: npm)" },
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: ["packages"],
+        },
+      },
+      {
+        name: "sandbox_status",
+        description: "Check the status of the current sandbox session. Shows sandbox ID, uptime, and available resources.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "destroy_sandbox",
+        description: "Destroy the current sandbox session and free resources. Use when done with a task.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "Session ID (default: 'default')" },
+          },
+          required: [],
+        },
+      },
+    ];
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result: { tools } })}\n\n`);
+    res.end();
+    return;
+  }
+
+  // Handle tools/call
+  if (method === "tools/call") {
+    const { name, arguments: args } = params || {};
+    const sessionId = args?.session_id || "default";
+
+    try {
+      const sandbox = await getOrCreateSandbox(sessionId);
+      let result: any;
+
+      switch (name) {
+        case "exec_command": {
+          const cmdResult = await sandbox.commands.run(args.command, {
+            cwd: args.workdir || "/home/user",
+            timeoutMs: args.timeout_ms || 60000,
+          });
+          result = { content: [{ type: "text", text: JSON.stringify({ stdout: cmdResult.stdout, stderr: cmdResult.stderr, exitCode: cmdResult.exitCode }, null, 2) }] };
+          break;
+        }
+        case "write_file": {
+          const dir = args.path.substring(0, args.path.lastIndexOf("/"));
+          if (dir) await sandbox.commands.run(`mkdir -p "${dir}"`);
+          await sandbox.files.write(args.path, args.content);
+          result = { content: [{ type: "text", text: `File written successfully: ${args.path}` }] };
+          break;
+        }
+        case "read_file": {
+          const content = await sandbox.files.read(args.path);
+          result = { content: [{ type: "text", text: String(content) }] };
+          break;
+        }
+        case "list_directory": {
+          const lsResult = await sandbox.commands.run(`ls -la "${args.path || "/home/user"}"`);
+          result = { content: [{ type: "text", text: lsResult.stdout || lsResult.stderr }] };
+          break;
+        }
+        case "upload_file_to_sandbox": {
+          const dir2 = args.destination_path.substring(0, args.destination_path.lastIndexOf("/"));
+          if (dir2) await sandbox.commands.run(`mkdir -p "${dir2}"`);
+          const dlResult = await sandbox.commands.run(`curl -sL -o "${args.destination_path}" "${args.url}"`);
+          if (dlResult.exitCode !== 0) throw new Error(dlResult.stderr || "Download failed");
+          const check = await sandbox.commands.run(`ls -la "${args.destination_path}"`);
+          result = { content: [{ type: "text", text: `File downloaded successfully:\n${check.stdout}` }] };
+          break;
+        }
+        case "get_public_url": {
+          const host = sandbox.getHost(args.port);
+          result = { content: [{ type: "text", text: JSON.stringify({ url: `https://${host}`, port: args.port, message: `Server on port ${args.port} is accessible at https://${host}` }, null, 2) }] };
+          break;
+        }
+        case "install_packages": {
+          const pm = args.manager || "npm";
+          const cmd = pm === "npm" ? `npm install ${args.packages}` : `pip install ${args.packages}`;
+          const installResult = await sandbox.commands.run(cmd, { cwd: "/home/user", timeoutMs: 120000 });
+          result = { content: [{ type: "text", text: JSON.stringify({ stdout: installResult.stdout.slice(-2000), stderr: installResult.stderr.slice(-1000), exitCode: installResult.exitCode, success: installResult.exitCode === 0 }, null, 2) }] };
+          break;
+        }
+        case "sandbox_status": {
+          const uptimeResult = await sandbox.commands.run("uptime && free -h && df -h /");
+          result = { content: [{ type: "text", text: JSON.stringify({ status: "running", sandbox_id: sandbox.sandboxId, active_sessions: sandboxes.size, system_info: uptimeResult.stdout }, null, 2) }] };
+          break;
+        }
+        case "destroy_sandbox": {
+          await destroySandbox(sessionId);
+          result = { content: [{ type: "text", text: `Sandbox session '${sessionId}' destroyed successfully.` }] };
+          break;
+        }
+        default:
+          result = { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
+      }
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result })}\n\n`);
+      res.end();
+    } catch (error: any) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      const errResult = { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, result: errResult })}\n\n`);
+      res.end();
+    }
+    return;
+  }
+
+  // Unknown method
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } })}\n\n`);
+  res.end();
+});
+
+// Also support SSE transport at /mcp for clients that use GET
 app.get("/mcp", (req, res) => {
   const server = createServer();
   const transport = new SSEServerTransport("/mcp/messages", res);
