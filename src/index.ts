@@ -22,7 +22,12 @@ async function getOrCreateSandbox(sessionId: string): Promise<Sandbox> {
   }
 
   console.log(`[Sandbox] Creating new sandbox for session: ${sessionId}`);
+  const apiKey = process.env.E2B_API_KEY;
+  if (!apiKey) {
+    throw new Error("E2B_API_KEY environment variable is not set");
+  }
   sandbox = await Sandbox.create({
+    apiKey,
     timeoutMs: SANDBOX_TIMEOUT,
   });
   sandboxes.set(sessionId, sandbox);
